@@ -418,6 +418,7 @@ Additionally, the inbuilt Assist tools can be disabled on a per-tool basis, in c
 
 - **Entity History Tool** — Retrieves the past (historic) states of an entity from the Home Assistant recorder database.
     This tool returns summary statistics (min, max, average for numeric entities) along with a downsampled set of significant state changes, making it efficient for the LLM to answer questions like _"What time did [name] get home last night?"_
+    For entities with a limited set of distinct states (such as location or presence sensors), the statistics also include `state_durations` — the total time spent in each state during the search period, computed from the full history — so questions like _"Where was [name] for most of today?"_ can be answered from computed totals rather than estimated from the sample.
 
 ---
 

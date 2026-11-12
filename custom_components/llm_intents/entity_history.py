@@ -34,6 +34,13 @@ class InvalidDateTimeError(HomeAssistantError):
 # the overall shape via summary stats + even downsampling.
 MAX_HISTORY_RESULTS = 30
 
+# Maximum number of distinct state values for which per-state total
+# durations are computed. Categorical entities (location, presence,
+# on/off) have a handful of states; numeric sensors can have hundreds
+# of distinct values, where per-state durations are meaningless bulk —
+# those keep the existing min/max/avg summary instead.
+MAX_DURATION_STATES = 30
+
 
 def _to_datetime(dt: str) -> datetime:
     try:
@@ -52,6 +59,39 @@ def _state_value(item: State | dict[str, Any]) -> str:
     return item.state if isinstance(item, State) else item["state"]
 
 
+def _state_timestamp(item: State | dict[str, Any]) -> float | None:
+    """
+    Extract the last_changed time of a state record as epoch seconds.
+
+    Handles State objects (datetime attribute) and the plain dicts
+    returned with minimal_response=True, whose timestamp may be an ISO
+    string or an epoch number depending on the HA version. Returns None
+    when no usable timestamp is present.
+    """
+    raw: Any
+    if isinstance(item, State):
+        raw = item.last_changed
+    else:
+        raw = None
+        for key in ("last_changed", "lc", "last_updated", "lu"):
+            if key in item:
+                raw = item[key]
+                break
+    if raw is None:
+        return None
+    try:
+        if isinstance(raw, datetime):
+            return raw.timestamp()
+        if isinstance(raw, (int, float)):
+            return float(raw)
+        parsed = datetime.fromisoformat(str(raw))
+        if parsed.tzinfo is None:
+            parsed = parsed.astimezone()
+        return parsed.timestamp()
+    except (ValueError, TypeError, OSError):
+        return None
+
+
 class EntityHistoryTool(BaseTool):
     """Tool for getting the significant change history of a device or entity."""
 
@@ -65,6 +105,7 @@ class EntityHistoryTool(BaseTool):
         "- If the user wants information for a particular time period, such as the morning, evening, or overnight, ensure that the start and end times encapsulate the entire duration.\n"
         "- If the user wants to know the last time something changed, ensure to use the current date and time as the search end time.\n"
         "- If the user wants to know when a person left or arrived home.\n"
+        "For entities with a limited set of distinct states (such as location or presence sensors), the result's stats also include `state_durations`: the total time spent in each state during the search period. Use those totals, rather than estimating from the sampled states, when answering how long a device was in a state or which state it was in for most of a period.\n"
         "Example queries: `What time did the kitchen reach 25 degrees?` `When was the bedroom light turned off?` `What was the temperature outside at 8am this morning?`"
     )
     prompt_description = None
@@ -145,6 +186,68 @@ class EntityHistoryTool(BaseTool):
         stats["start_end_delta"] = round(numeric_values[-1] - numeric_values[0], 2)
 
         return stats
+
+    @staticmethod
+    def _compute_state_durations(
+        states: list[State | dict[str, Any]],
+        window_start: datetime | None,
+        window_end: datetime | None,
+    ) -> list[dict[str, Any]]:
+        """
+        Compute the total time spent in each distinct state.
+
+        Each record's state is taken to last until the next record's
+        last_changed; the first record is clamped to the window start
+        and the final record runs to the window end. Unlike the sampled
+        states, this is computed from the full (unfiltered) sequence —
+        'unknown'/'unavailable' periods are real elapsed time and are
+        reported as their own entries so shares stay honest.
+
+        Returns an empty list when durations would be meaningless bulk
+        (more than MAX_DURATION_STATES distinct values, e.g. a numeric
+        sensor) or cannot be derived from the records available.
+        """
+        points: list[tuple[float, str]] = []
+        for item in states:
+            ts = _state_timestamp(item)
+            if ts is not None:
+                points.append((ts, _state_value(item)))
+        if not points:
+            return []
+
+        points.sort(key=lambda point: point[0])
+
+        if len({value for _, value in points}) > MAX_DURATION_STATES:
+            return []
+
+        start_ts = (
+            window_start.timestamp() if window_start is not None else points[0][0]
+        )
+        end_ts = window_end.timestamp() if window_end is not None else points[-1][0]
+
+        totals: dict[str, float] = {}
+        for i, (ts, value) in enumerate(points):
+            segment_start = max(ts, start_ts)
+            segment_end = points[i + 1][0] if i + 1 < len(points) else end_ts
+            segment_end = min(segment_end, end_ts)
+            if segment_end > segment_start:
+                totals[value] = totals.get(value, 0.0) + (segment_end - segment_start)
+
+        total_seconds = sum(totals.values())
+        if total_seconds <= 0:
+            return []
+
+        return [
+            {
+                "state": value,
+                "total_seconds": round(seconds),
+                "total_minutes": round(seconds / 60, 1),
+                "percent": round(seconds / total_seconds * 100, 1),
+            }
+            for value, seconds in sorted(
+                totals.items(), key=lambda item: item[1], reverse=True
+            )
+        ]
 
     @staticmethod
     def _downsample(
@@ -246,11 +349,18 @@ class EntityHistoryTool(BaseTool):
                     )
                 )
 
+            # The final state cannot have lasted beyond the present
+            # moment, even when the requested end is in the future
+            # (e.g. "until 23:59" asked mid-day).
+            effective_end = min(end_time, datetime.now(end_time.tzinfo))
+
             results: dict[str, Any] = {}
             for sublist in result.values():
                 if not sublist:
                     continue
-                results = self._process_entity_states(sublist, results)
+                results = self._process_entity_states(
+                    sublist, results, start_time, effective_end
+                )
 
             return ToolResult(data=results)
         except Exception as e:
@@ -260,7 +370,11 @@ class EntityHistoryTool(BaseTool):
             )
 
     def _process_entity_states(
-        self, sublist: list, results: dict[str, Any]
+        self,
+        sublist: list,
+        results: dict[str, Any],
+        window_start: datetime | None = None,
+        window_end: datetime | None = None,
     ) -> dict[str, Any]:
         """Process a single entity's state list into LLM-friendly format."""
         start_state = sublist[0]
@@ -270,9 +384,21 @@ class EntityHistoryTool(BaseTool):
         filtered = self._filter_unavailable(remaining)
 
         if not filtered:
-            return self._build_empty_result(start_state, last_state, results)
+            result = self._build_empty_result(start_state, last_state, results)
+        else:
+            result = self._build_result_with_stats(
+                start_state, filtered, last_state, results
+            )
 
-        return self._build_result_with_stats(start_state, filtered, last_state, results)
+        # Durations are computed from the full sequence (including the
+        # start record and any unknown/unavailable periods) so the LLM
+        # can answer "how long" / "most of the period" questions from
+        # computed totals instead of estimating over the sampled states.
+        durations = self._compute_state_durations(sublist, window_start, window_end)
+        if durations:
+            result["stats"]["state_durations"] = durations
+
+        return result
 
     def _filter_unavailable(self, states: list) -> list[State | dict[str, Any]]:
         """Remove unavailable/unknown records that add no useful context."""
