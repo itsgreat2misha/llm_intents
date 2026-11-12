@@ -106,6 +106,7 @@ class EntityHistoryTool(BaseTool):
         "- If the user wants to know the last time something changed, ensure to use the current date and time as the search end time.\n"
         "- If the user wants to know when a person left or arrived home.\n"
         "For entities with a limited set of distinct states (such as location or presence sensors), the result's stats also include `state_durations`: the total time spent in each state during the search period. Use those totals, rather than estimating from the sampled states, when answering how long a device was in a state or which state it was in for most of a period.\n"
+        "For numeric entities, the stats also include `time_weighted_avg`: the average value weighted by how long each value was held. Prefer it over the plain `avg` when answering what the average value was over a period.\n"
         "Example queries: `What time did the kitchen reach 25 degrees?` `When was the bedroom light turned off?` `What was the temperature outside at 8am this morning?`"
     )
     prompt_description = None
@@ -248,6 +249,65 @@ class EntityHistoryTool(BaseTool):
                 totals.items(), key=lambda item: item[1], reverse=True
             )
         ]
+
+    @staticmethod
+    def _compute_time_weighted_average(
+        states: list[State | dict[str, Any]],
+        window_start: datetime | None,
+        window_end: datetime | None,
+    ) -> float | None:
+        """
+        Compute the time-weighted average of a numeric entity.
+
+        The plain `avg` stat weights every state change equally, so a
+        brief spike counts as much as a value held for hours. Here each
+        value is weighted by how long the entity held it: each record
+        lasts until the next record, the first record is clamped to the
+        window start, and the final record runs to the window end.
+
+        The caller passes the sequence with unknown/unavailable records
+        already removed, so a gap is attributed to the last known value
+        (the same basis as the other summary stats). A non-numeric first
+        record (e.g. the entity was unknown at the window start) is
+        skipped without extending the next value back over it.
+
+        Returns None when no time-weighted average can be derived.
+        """
+        points: list[tuple[float, float, bool]] = []
+        for idx, item in enumerate(states):
+            ts = _state_timestamp(item)
+            if ts is None:
+                continue
+            try:
+                value = float(_state_value(item))
+            except (ValueError, TypeError):
+                continue
+            points.append((ts, value, idx == 0))
+        if not points:
+            return None
+
+        points.sort(key=lambda point: point[0])
+
+        start_ts = (
+            window_start.timestamp() if window_start is not None else points[0][0]
+        )
+        end_ts = window_end.timestamp() if window_end is not None else points[-1][0]
+
+        weighted_sum = 0.0
+        total_seconds = 0.0
+        for i, (ts, value, is_first) in enumerate(points):
+            segment_start = max(ts, start_ts) if is_first else ts
+            segment_end = points[i + 1][0] if i + 1 < len(points) else end_ts
+            segment_end = min(segment_end, end_ts)
+            if segment_end > segment_start:
+                duration = segment_end - segment_start
+                weighted_sum += value * duration
+                total_seconds += duration
+
+        if total_seconds <= 0:
+            return None
+
+        return round(weighted_sum / total_seconds, 2)
 
     @staticmethod
     def _downsample(
@@ -397,6 +457,14 @@ class EntityHistoryTool(BaseTool):
         durations = self._compute_state_durations(sublist, window_start, window_end)
         if durations:
             result["stats"]["state_durations"] = durations
+
+        # The time-weighted average uses the start record plus the
+        # filtered sequence — the same basis as the other summary stats.
+        time_weighted_avg = self._compute_time_weighted_average(
+            [start_state, *filtered], window_start, window_end
+        )
+        if time_weighted_avg is not None:
+            result["stats"]["time_weighted_avg"] = time_weighted_avg
 
         return result
 

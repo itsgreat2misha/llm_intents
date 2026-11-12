@@ -775,3 +775,62 @@ async def test_state_durations_majority_by_time(
     ]
     assert durations[0]["total_seconds"] == 5 * 3600
     assert durations[0]["percent"] == pytest.approx(83.3)
+
+
+def test_time_weighted_average_weights_by_duration() -> None:
+    """A value held for 50 minutes outweighs one held for 10."""
+    tool = EntityHistoryTool({}, MagicMock())
+    base = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
+    states = [
+        State("sensor.test", "20.0", last_changed=base),
+        State("sensor.test", "30.0", last_changed=base + timedelta(minutes=50)),
+    ]
+    result = tool._compute_time_weighted_average(
+        states, base, base + timedelta(hours=1)
+    )
+    # (20*50 + 30*10) / 60 = 21.67, not the plain mean of 25.0.
+    assert result == pytest.approx(21.67)
+
+
+def test_time_weighted_average_non_numeric() -> None:
+    """Non-numeric entities have no time-weighted average."""
+    tool = EntityHistoryTool({}, MagicMock())
+    base = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
+    states = [
+        State("sensor.test", "on", last_changed=base),
+        State("sensor.test", "off", last_changed=base + timedelta(minutes=30)),
+    ]
+    assert (
+        tool._compute_time_weighted_average(states, base, base + timedelta(hours=1))
+        is None
+    )
+
+
+def test_time_weighted_average_unknown_start_not_extended() -> None:
+    """A non-numeric first record is skipped, not back-filled."""
+    tool = EntityHistoryTool({}, MagicMock())
+    base = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
+    states = [
+        State("sensor.test", "unknown", last_changed=base),
+        State("sensor.test", "20.0", last_changed=base + timedelta(minutes=10)),
+        State("sensor.test", "30.0", last_changed=base + timedelta(minutes=40)),
+    ]
+    result = tool._compute_time_weighted_average(
+        states, base, base + timedelta(hours=1)
+    )
+    # 20 held 10:10-10:40 (30 min), 30 held 10:40-11:00 (20 min):
+    # (20*30 + 30*20) / 50 = 24.0. Extending 20 back over the unknown
+    # prefix would give 23.33 instead.
+    assert result == pytest.approx(24.0)
+
+
+def test_time_weighted_average_in_stats() -> None:
+    """_process_entity_states attaches time_weighted_avg to the stats."""
+    tool = EntityHistoryTool({}, MagicMock())
+    base = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
+    sublist = [
+        State("sensor.test", "20.0", last_changed=base),
+        State("sensor.test", "30.0", last_changed=base + timedelta(minutes=50)),
+    ]
+    result = tool._process_entity_states(sublist, {}, base, base + timedelta(hours=1))
+    assert result["stats"]["time_weighted_avg"] == pytest.approx(21.67)
