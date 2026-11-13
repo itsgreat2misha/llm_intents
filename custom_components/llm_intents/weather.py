@@ -73,6 +73,39 @@ def _format_percent(value: Any) -> str:
     return f"{round(float(value))}%"
 
 
+def _format_temperature(value: Any, unit: UnitOfTemperature) -> str:
+    """
+    Format a temperature with both Fahrenheit and Celsius values.
+
+    The value is assumed to be in the given unit; the other unit's value is
+    computed here so the LLM copies both instead of converting them itself.
+    """
+    temp = float(value)
+    if unit == UnitOfTemperature.CELSIUS:
+        return f"{round(temp)}°C ({round(temp * 9 / 5 + 32)}°F)"
+    return f"{round(temp)}°F ({round((temp - 32) * 5 / 9)}°C)"
+
+
+def _format_temperature_range(
+    low: Any,
+    high: Any,
+    unit: UnitOfTemperature,
+) -> str:
+    """Format a low/high temperature pair with both units."""
+    if low is None:
+        return _format_temperature(high, unit)
+    return f"{_format_temperature(low, unit)} - {_format_temperature(high, unit)}"
+
+
+def _temperature_formatter(unit: UnitOfTemperature) -> Callable[[Any], str]:
+    """Return a formatter rendering temperatures in both units."""
+
+    def format_temperature(value: Any) -> str:
+        return _format_temperature(value, unit)
+
+    return format_temperature
+
+
 class WeatherAttribute:
     """Represent a weather attribute."""
 
@@ -146,6 +179,7 @@ class WeatherForecastTool(BaseTool):
     description = (
         "Use this tool to retrieve the current weather conditions and weather forecasts for this home, from now up until a week in advance.\n"
         "Current conditions include temperature, feels-like temperature, humidity, wind, and pressure: use this tool for questions about current outdoor conditions instead of looking for a sensor.\n"
+        "All temperatures in the result are stated in both Fahrenheit and Celsius.\n"
         "If the user requests data for `tonight`, use the `today` argument.\n"
         "For weather in another place, pass the `location` argument with the name of the place (for example 'Orlando'): current conditions and the forecast for that place are retrieved from Open-Meteo.\n"
         "Cannot be used to retrieve past or historic weather data: local sensor history can be queried via the device history tool."
@@ -283,13 +317,11 @@ class WeatherForecastTool(BaseTool):
             ),
         ]
 
+        unit = hass.config.units.temperature_unit
         output = []
         for day in forecast:
-            temp_low = day.get("templow")
-            temperature = (
-                f"{round(temp_low)} - {round(day['temperature'])}"
-                if temp_low is not None
-                else round(day["temperature"])
+            temperature = _format_temperature_range(
+                day.get("templow"), day["temperature"], unit
             )
             output.append(
                 "\n".join(
@@ -353,13 +385,11 @@ class WeatherForecastTool(BaseTool):
 
             days[date_str][day_night] = day
 
+        unit = hass.config.units.temperature_unit
         output = []
         for day in forecast:
-            temp_low = day.get("templow")
-            temperature = (
-                f"{round(temp_low)} - {round(day['temperature'])}"
-                if temp_low is not None
-                else round(day["temperature"])
+            temperature = _format_temperature_range(
+                day.get("templow"), day["temperature"], unit
             )
             output.append(
                 "\n".join(
@@ -404,13 +434,14 @@ class WeatherForecastTool(BaseTool):
             ),
         ]
 
+        unit = hass.config.units.temperature_unit
         output = []
         for hour in forecast:
             output.append(
                 "\n".join(
                     [
                         f"- Time: {self._format_time(hour['datetime'])}",
-                        f"  Temperature: {round(hour['temperature'])}",
+                        f"  Temperature: {_format_temperature(hour['temperature'], unit)}",
                         *_build_attributes(hourly_attributes, hour),
                     ],
                 ),
@@ -428,12 +459,18 @@ class WeatherForecastTool(BaseTool):
         sensor_state = hass.states.get(temperature_entity_id)
         if sensor_state and sensor_state.state not in ("unknown", "unavailable"):
             try:
-                current_temp = round(float(sensor_state.state))
+                current_temp = float(sensor_state.state)
+                unit = hass.config.units.temperature_unit
+                sensor_unit = sensor_state.attributes.get("unit_of_measurement")
+                if sensor_unit == UnitOfTemperature.CELSIUS:
+                    unit = UnitOfTemperature.CELSIUS
+                elif sensor_unit == UnitOfTemperature.FAHRENHEIT:
+                    unit = UnitOfTemperature.FAHRENHEIT
                 output.append(
                     "\n".join(
                         [
                             "- Time: current",
-                            f"  Temperature: {current_temp}",
+                            f"  Temperature: {_format_temperature(current_temp, unit)}",
                         ],
                     ),
                 )
@@ -458,23 +495,24 @@ class WeatherForecastTool(BaseTool):
             return None
         data = dict(entity.attributes)
         data["condition"] = entity.state
+        temp_formatter = _temperature_formatter(hass.config.units.temperature_unit)
         current_attributes = [
             WeatherAttribute(key="condition", name="General Condition", formatter=None),
             WeatherAttribute(
                 key="temperature",
                 name="Temperature",
-                formatter=lambda v: round(float(v)),
+                formatter=temp_formatter,
             ),
             WeatherAttribute(
                 key="apparent_temperature",
                 name="Feels Like",
-                formatter=lambda v: round(float(v)),
+                formatter=temp_formatter,
             ),
             WeatherAttribute(
                 key="humidity", name="Humidity", formatter=_format_percent
             ),
             WeatherAttribute(
-                key="dew_point", name="Dew Point", formatter=lambda v: round(float(v))
+                key="dew_point", name="Dew Point", formatter=temp_formatter
             ),
             WeatherAttribute(
                 key="wind_speed", name="Wind Speed", formatter=lambda v: round(float(v))
@@ -568,6 +606,12 @@ class WeatherForecastTool(BaseTool):
         if hass.config.units.temperature_unit != UnitOfTemperature.CELSIUS:
             params["temperature_unit"] = "fahrenheit"
             params["wind_speed_unit"] = "mph"
+        unit = (
+            UnitOfTemperature.CELSIUS
+            if hass.config.units.temperature_unit == UnitOfTemperature.CELSIUS
+            else UnitOfTemperature.FAHRENHEIT
+        )
+        temp_formatter = _temperature_formatter(unit)
 
         async with session.get(
             "https://api.open-meteo.com/v1/forecast",
@@ -609,12 +653,12 @@ class WeatherForecastTool(BaseTool):
                 WeatherAttribute(
                     key="temperature",
                     name="Temperature",
-                    formatter=lambda v: round(float(v)),
+                    formatter=temp_formatter,
                 ),
                 WeatherAttribute(
                     key="apparent_temperature",
                     name="Feels Like",
-                    formatter=lambda v: round(float(v)),
+                    formatter=temp_formatter,
                 ),
                 WeatherAttribute(
                     key="humidity", name="Humidity", formatter=_format_percent
@@ -622,7 +666,7 @@ class WeatherForecastTool(BaseTool):
                 WeatherAttribute(
                     key="dew_point",
                     name="Dew Point",
-                    formatter=lambda v: round(float(v)),
+                    formatter=temp_formatter,
                 ),
                 WeatherAttribute(
                     key="wind_speed",
@@ -665,12 +709,10 @@ class WeatherForecastTool(BaseTool):
                 "precipitation_probability": precip_max[i],
                 "humidity": humidity_mean[i],
             }
-            temp_low = daily["temperature_2m_min"][i]
-            temp_high = daily["temperature_2m_max"][i]
-            temperature = (
-                f"{round(temp_low)} - {round(temp_high)}"
-                if temp_low is not None
-                else round(temp_high)
+            temperature = _format_temperature_range(
+                daily["temperature_2m_min"][i],
+                daily["temperature_2m_max"][i],
+                unit,
             )
             weekday = date.fromisoformat(day_str).strftime("%A")
             label = (
@@ -713,7 +755,7 @@ class WeatherForecastTool(BaseTool):
                     "\n".join(
                         [
                             f"- Time: {hour_label}",
-                            f"  Temperature: {round(hourly['temperature_2m'][i])}",
+                            f"  Temperature: {_format_temperature(hourly['temperature_2m'][i], unit)}",
                             *_build_attributes(hourly_attributes, hour_data),
                         ],
                     ),
