@@ -22,6 +22,8 @@ from custom_components.llm_intents.weather import (
     _friendly_precipitation_chance,
 )
 
+from .utils import MockContext
+
 
 @pytest.fixture
 def tool(hass: HomeAssistant) -> WeatherForecastTool:
@@ -928,3 +930,219 @@ async def test_async_call_no_forecast_fallback(
     assert (
         result.data["result"] == "No weather forecast available for the selected range"
     )
+
+
+# =============================================================================
+# Current conditions and Open-Meteo location tests
+# =============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.freeze_time("2026-05-03")
+async def test_async_call_prepends_current_conditions(hass: HomeAssistant) -> None:
+    """Current conditions from the weather entity precede today's forecast."""
+    tool = WeatherForecastTool(
+        {"weather_daily_entity": "weather.test"},
+        hass,
+    )
+    tool_input = llm.ToolInput(
+        tool_args={"range": "today"},
+        tool_name="get_weather_forecast",
+    )
+
+    forecast_data = [
+        {
+            "datetime": "2026-05-03T12:00:00+00:00",
+            "temperature": 22,
+            "templow": 17,
+            "condition": "Sunny",
+            "precipitation_probability": 30,
+            "humidity": 65,
+        }
+    ]
+
+    async def mock_async_call(*args: object, **kwargs: Any) -> dict:
+        return {"weather.test": {"forecast": forecast_data}}
+
+    mock_services = MagicMock()
+    mock_services.async_call = mock_async_call
+    tool.hass.services = mock_services
+
+    mock_states = MagicMock()
+    entity = MagicMock()
+    entity.state = "partlycloudy"
+    entity.attributes = {
+        "supported_features": 0,
+        "temperature": 21.6,
+        "apparent_temperature": 20.2,
+        "humidity": 78,
+        "wind_speed": 12.4,
+        "pressure": 1013,
+    }
+    mock_states.get.return_value = entity
+    tool.hass.states = mock_states
+
+    result = await tool.async_call(
+        hass,
+        tool_input,
+        MagicMock(spec=llm.LLMContext),
+    )
+    assert isinstance(result, ToolResult)
+
+    text = result.data["result"]
+    assert "- Time: current" in text
+    assert "General Condition: partlycloudy" in text
+    assert "Feels Like: 20" in text
+    assert "Humidity: 78%" in text
+    # Humidity is also reported inside the daily forecast itself.
+    assert "Humidity: 65%" in text
+    # Current conditions come before the day's forecast block.
+    assert text.index("- Time: current") < text.index("- Date:")
+
+
+def test_get_current_conditions_sparse_and_missing() -> None:
+    """Current conditions degrade gracefully with sparse attributes."""
+    hass = MagicMock()
+    entity = MagicMock()
+    entity.state = "sunny"
+    entity.attributes = {"humidity": 55}
+    hass.states.get.return_value = entity
+
+    result = WeatherForecastTool._get_current_conditions(hass, "weather.test")
+    assert result is not None
+    assert "Humidity: 55%" in result
+    assert "Temperature" not in result
+
+    hass.states.get.return_value = None
+    assert WeatherForecastTool._get_current_conditions(hass, "weather.test") is None
+    assert WeatherForecastTool._get_current_conditions(hass, None) is None
+
+
+def test_remote_target_date() -> None:
+    """Remote target dates resolve on the place's own calendar."""
+    sunday = date(2026, 5, 3)  # 2026-05-03 is a Sunday
+    assert WeatherForecastTool._remote_target_date("today", sunday) == sunday
+    assert WeatherForecastTool._remote_target_date("tomorrow", sunday) == date(
+        2026, 5, 4
+    )
+    assert WeatherForecastTool._remote_target_date("week", sunday) is None
+    assert WeatherForecastTool._remote_target_date("monday", sunday) == date(2026, 5, 4)
+    assert WeatherForecastTool._remote_target_date("sunday", sunday) == sunday
+
+
+def _open_meteo_session(geo_data: dict, forecast_data: dict | None = None) -> MagicMock:
+    """Build a mock client session dispatching Open-Meteo GETs by URL."""
+
+    def mock_get(url: str, **_kwargs: Any) -> MockContext:
+        response = MagicMock()
+        response.status = 200
+        response.raise_for_status = MagicMock()
+        if "geocoding" in url:
+            response.json = AsyncMock(return_value=geo_data)
+        else:
+            response.json = AsyncMock(return_value=forecast_data)
+        return MockContext(response)
+
+    session = MagicMock()
+    session.get = MagicMock(side_effect=mock_get)
+    return session
+
+
+@pytest.mark.asyncio
+async def test_async_call_location_uses_open_meteo(hass: HomeAssistant) -> None:
+    """A location argument answers from Open-Meteo for that place."""
+    tool = WeatherForecastTool({}, hass)
+    tool_input = llm.ToolInput(
+        tool_args={"range": "today", "location": "Orlando"},
+        tool_name="get_weather_forecast",
+    )
+    geo_data = {
+        "results": [
+            {
+                "name": "Orlando",
+                "admin1": "Florida",
+                "country": "United States",
+                "latitude": 28.5455,
+                "longitude": -81.3392,
+            }
+        ]
+    }
+    forecast_data = {
+        "current": {
+            "time": "2026-05-03T12:00",
+            "temperature_2m": 30.2,
+            "relative_humidity_2m": 70,
+            "apparent_temperature": 33.1,
+            "dew_point_2m": 22.0,
+            "weather_code": 2,
+            "wind_speed_10m": 10.0,
+            "wind_gusts_10m": 20.0,
+            "surface_pressure": 1015.0,
+        },
+        "daily": {
+            "time": ["2026-05-03", "2026-05-04"],
+            "weather_code": [2, 61],
+            "temperature_2m_max": [31.0, 29.0],
+            "temperature_2m_min": [22.0, 21.0],
+            "precipitation_probability_max": [20, 60],
+            "relative_humidity_2m_mean": [70, 75],
+        },
+        "hourly": {
+            "time": ["2026-05-03T00:00", "2026-05-03T01:00"],
+            "temperature_2m": [25.0, 24.5],
+            "precipitation_probability": [10, 20],
+            "relative_humidity_2m": [80, 82],
+        },
+    }
+    session = _open_meteo_session(geo_data, forecast_data)
+
+    with patch(
+        "custom_components.llm_intents.weather.async_get_clientsession",
+        return_value=session,
+    ):
+        result = await tool.async_call(
+            hass,
+            tool_input,
+            MagicMock(spec=llm.LLMContext),
+        )
+
+    assert isinstance(result, ToolResult)
+    text = result.data["result"]
+    assert text.startswith(
+        "Weather for Orlando, Florida, United States (source: Open-Meteo, CC BY 4.0)"
+    )
+    assert "- Time: current" in text
+    assert "Temperature: 30" in text
+    assert "Humidity: 70%" in text
+    assert "Today (Sunday)" in text
+    assert "- Time: 12am" in text
+    assert "Humidity: 80%" in text
+
+
+@pytest.mark.asyncio
+async def test_async_call_location_unknown_place(hass: HomeAssistant) -> None:
+    """An unresolvable location surfaces a clear error."""
+    tool = WeatherForecastTool({}, hass)
+    tool_input = llm.ToolInput(
+        tool_args={"range": "today", "location": "Nowhereville"},
+        tool_name="get_weather_forecast",
+    )
+    session = _open_meteo_session({"results": []})
+
+    with patch(
+        "custom_components.llm_intents.weather.async_get_clientsession",
+        return_value=session,
+    ):
+        result = await tool.async_call(
+            hass,
+            tool_input,
+            MagicMock(spec=llm.LLMContext),
+        )
+
+    assert isinstance(result, ToolResult)
+    assert result.data == {
+        "error": (
+            "Error retrieving weather for Nowhereville: "
+            "Could not find a place named 'Nowhereville'"
+        )
+    }
