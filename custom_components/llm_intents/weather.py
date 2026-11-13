@@ -11,7 +11,7 @@ from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import llm
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.util.json import JsonObjectType
+from homeassistant.helpers.llm import ToolResult
 
 from .base_tool import BaseTool
 from .const import (
@@ -278,7 +278,9 @@ class WeatherForecastTool(BaseTool):
                 name="Chance of Precipitation",
                 formatter=_friendly_precipitation_chance,
             ),
-            WeatherAttribute(key="humidity", name="Humidity", formatter=_format_percent),
+            WeatherAttribute(
+                key="humidity", name="Humidity", formatter=_format_percent
+            ),
         ]
 
         output = []
@@ -329,7 +331,9 @@ class WeatherForecastTool(BaseTool):
                 name="Chance of Precipitation",
                 formatter=_friendly_precipitation_chance,
             ),
-            WeatherAttribute(key="humidity", name="Humidity", formatter=_format_percent),
+            WeatherAttribute(
+                key="humidity", name="Humidity", formatter=_format_percent
+            ),
         ]
 
         days = {}
@@ -395,7 +399,9 @@ class WeatherForecastTool(BaseTool):
                 key="precipitation_probability",
                 formatter=_friendly_precipitation_chance,
             ),
-            WeatherAttribute(key="humidity", name="Humidity", formatter=_format_percent),
+            WeatherAttribute(
+                key="humidity", name="Humidity", formatter=_format_percent
+            ),
         ]
 
         output = []
@@ -454,13 +460,33 @@ class WeatherForecastTool(BaseTool):
         data["condition"] = entity.state
         current_attributes = [
             WeatherAttribute(key="condition", name="General Condition", formatter=None),
-            WeatherAttribute(key="temperature", name="Temperature", formatter=lambda v: round(float(v))),
-            WeatherAttribute(key="apparent_temperature", name="Feels Like", formatter=lambda v: round(float(v))),
-            WeatherAttribute(key="humidity", name="Humidity", formatter=_format_percent),
-            WeatherAttribute(key="dew_point", name="Dew Point", formatter=lambda v: round(float(v))),
-            WeatherAttribute(key="wind_speed", name="Wind Speed", formatter=lambda v: round(float(v))),
-            WeatherAttribute(key="wind_gust_speed", name="Wind Gusts", formatter=lambda v: round(float(v))),
-            WeatherAttribute(key="pressure", name="Pressure", formatter=lambda v: round(float(v))),
+            WeatherAttribute(
+                key="temperature",
+                name="Temperature",
+                formatter=lambda v: round(float(v)),
+            ),
+            WeatherAttribute(
+                key="apparent_temperature",
+                name="Feels Like",
+                formatter=lambda v: round(float(v)),
+            ),
+            WeatherAttribute(
+                key="humidity", name="Humidity", formatter=_format_percent
+            ),
+            WeatherAttribute(
+                key="dew_point", name="Dew Point", formatter=lambda v: round(float(v))
+            ),
+            WeatherAttribute(
+                key="wind_speed", name="Wind Speed", formatter=lambda v: round(float(v))
+            ),
+            WeatherAttribute(
+                key="wind_gust_speed",
+                name="Wind Gusts",
+                formatter=lambda v: round(float(v)),
+            ),
+            WeatherAttribute(
+                key="pressure", name="Pressure", formatter=lambda v: round(float(v))
+            ),
         ]
         lines = _build_attributes(current_attributes, data)
         if not lines:
@@ -497,7 +523,8 @@ class WeatherForecastTool(BaseTool):
         location: str,
         date_range: str,
     ) -> str:
-        """Get current conditions and forecast for another place from Open-Meteo.
+        """
+        Get current conditions and forecast for another place from Open-Meteo.
 
         Open-Meteo's free API explicitly permits personal home automation use;
         data is CC BY 4.0, hence the source attribution in the output.
@@ -518,9 +545,8 @@ class WeatherForecastTool(BaseTool):
 
         results = geo.get("results") or []
         if not results:
-            raise ForecastRetrievalError(
-                f"Could not find a place named '{location}'",
-            )
+            message = f"Could not find a place named '{location}'"
+            raise ForecastRetrievalError(message)
         place = results[0]
 
         params: dict[str, Any] = {
@@ -577,14 +603,40 @@ class WeatherForecastTool(BaseTool):
                 "pressure": current.get("surface_pressure"),
             }
             current_attributes = [
-                WeatherAttribute(key="condition", name="General Condition", formatter=None),
-                WeatherAttribute(key="temperature", name="Temperature", formatter=lambda v: round(float(v))),
-                WeatherAttribute(key="apparent_temperature", name="Feels Like", formatter=lambda v: round(float(v))),
-                WeatherAttribute(key="humidity", name="Humidity", formatter=_format_percent),
-                WeatherAttribute(key="dew_point", name="Dew Point", formatter=lambda v: round(float(v))),
-                WeatherAttribute(key="wind_speed", name="Wind Speed", formatter=lambda v: round(float(v))),
-                WeatherAttribute(key="wind_gust_speed", name="Wind Gusts", formatter=lambda v: round(float(v))),
-                WeatherAttribute(key="pressure", name="Pressure", formatter=lambda v: round(float(v))),
+                WeatherAttribute(
+                    key="condition", name="General Condition", formatter=None
+                ),
+                WeatherAttribute(
+                    key="temperature",
+                    name="Temperature",
+                    formatter=lambda v: round(float(v)),
+                ),
+                WeatherAttribute(
+                    key="apparent_temperature",
+                    name="Feels Like",
+                    formatter=lambda v: round(float(v)),
+                ),
+                WeatherAttribute(
+                    key="humidity", name="Humidity", formatter=_format_percent
+                ),
+                WeatherAttribute(
+                    key="dew_point",
+                    name="Dew Point",
+                    formatter=lambda v: round(float(v)),
+                ),
+                WeatherAttribute(
+                    key="wind_speed",
+                    name="Wind Speed",
+                    formatter=lambda v: round(float(v)),
+                ),
+                WeatherAttribute(
+                    key="wind_gust_speed",
+                    name="Wind Gusts",
+                    formatter=lambda v: round(float(v)),
+                ),
+                WeatherAttribute(
+                    key="pressure", name="Pressure", formatter=lambda v: round(float(v))
+                ),
             ]
             built = _build_attributes(current_attributes, current_data)
             if built:
@@ -598,7 +650,9 @@ class WeatherForecastTool(BaseTool):
                 name="Chance of Precipitation",
                 formatter=_friendly_precipitation_chance,
             ),
-            WeatherAttribute(key="humidity", name="Humidity", formatter=_format_percent),
+            WeatherAttribute(
+                key="humidity", name="Humidity", formatter=_format_percent
+            ),
         ]
         day_count = len(daily.get("time", []))
         precip_max = daily.get("precipitation_probability_max") or [None] * day_count
@@ -619,7 +673,9 @@ class WeatherForecastTool(BaseTool):
                 else round(temp_high)
             )
             weekday = date.fromisoformat(day_str).strftime("%A")
-            label = f"Today ({weekday})" if day_str == place_today.isoformat() else weekday
+            label = (
+                f"Today ({weekday})" if day_str == place_today.isoformat() else weekday
+            )
             lines.append(
                 "\n".join(
                     [
@@ -641,7 +697,9 @@ class WeatherForecastTool(BaseTool):
                     key="precipitation_probability",
                     formatter=_friendly_precipitation_chance,
                 ),
-                WeatherAttribute(key="humidity", name="Humidity", formatter=_format_percent),
+                WeatherAttribute(
+                    key="humidity", name="Humidity", formatter=_format_percent
+                ),
             ]
             for i, time_str in enumerate(hourly.get("time", [])):
                 if not time_str.startswith(target_date.isoformat()):
@@ -668,7 +726,7 @@ class WeatherForecastTool(BaseTool):
         hass: HomeAssistant,
         tool_input: llm.ToolInput,
         llm_context: llm.LLMContext,
-    ) -> JsonObjectType:
+    ) -> ToolResult:
         """Call the tool."""
         config_data = self.config
 
@@ -678,10 +736,19 @@ class WeatherForecastTool(BaseTool):
         location = tool_input.tool_args.get("location")
         if location:
             try:
-                return await self._get_open_meteo_forecast(hass, location, date_range)
+                return ToolResult(
+                    data={
+                        "result": await self._get_open_meteo_forecast(
+                            hass, location, date_range
+                        )
+                    }
+                )
             except Exception as e:
                 _LOGGER.exception(msg="Open-Meteo weather lookup encountered an error")
-                return {"error": f"Error retrieving weather for {location}: {e!s}"}
+                return ToolResult(
+                    data={"error": f"Error retrieving weather for {location}: {e!s}"},
+                    error=True,
+                )
 
         try:
             hourly_entity_id = config_data.get(CONF_HOURLY_WEATHER_ENTITY)
@@ -739,7 +806,10 @@ class WeatherForecastTool(BaseTool):
             if not forecast:
                 forecast = "No weather forecast available for the selected range"
 
-            return forecast
+            return ToolResult(data={"result": forecast})
         except Exception as e:
             _LOGGER.exception(msg="Weather forecast encountered an error")
-            return {"error": f"Error retrieving weather forecast: {e!s}"}
+            return ToolResult(
+                data={"error": f"Error retrieving weather forecast: {e!s}"},
+                error=True,
+            )
