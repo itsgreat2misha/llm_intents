@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from homeassistant.components.weather import WeatherEntityFeature
+from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import llm
 from homeassistant.helpers.llm import ToolResult
@@ -19,6 +20,8 @@ from custom_components.llm_intents.weather import (
     WeatherEntityNotFoundError,
     WeatherForecastTool,
     _build_attributes,
+    _format_temperature,
+    _format_temperature_range,
     _friendly_precipitation_chance,
 )
 
@@ -58,6 +61,38 @@ def test_friendly_precipitation_chance(
     """Test precipitation chance categorization at various thresholds."""
     result = _friendly_precipitation_chance(precipitation_chance)
     assert result == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "unit", "expected"),
+    [
+        (41, UnitOfTemperature.FAHRENHEIT, "41°F (5°C)"),
+        (66, UnitOfTemperature.FAHRENHEIT, "66°F (19°C)"),
+        (32, UnitOfTemperature.FAHRENHEIT, "32°F (0°C)"),
+        (-40, UnitOfTemperature.FAHRENHEIT, "-40°F (-40°C)"),
+        (0, UnitOfTemperature.CELSIUS, "0°C (32°F)"),
+        (20, UnitOfTemperature.CELSIUS, "20°C (68°F)"),
+        (100, UnitOfTemperature.CELSIUS, "100°C (212°F)"),
+        (21.6, UnitOfTemperature.CELSIUS, "22°C (71°F)"),
+    ],
+)
+def test_format_temperature(
+    value: float, unit: UnitOfTemperature, expected: str
+) -> None:
+    """Test temperatures are rendered in both Fahrenheit and Celsius."""
+    assert _format_temperature(value, unit) == expected
+
+
+def test_format_temperature_range() -> None:
+    """Test low/high pairs render both units; a missing low gives one value."""
+    assert (
+        _format_temperature_range(32, 49, UnitOfTemperature.FAHRENHEIT)
+        == "32°F (0°C) - 49°F (9°C)"
+    )
+    assert (
+        _format_temperature_range(None, 49, UnitOfTemperature.FAHRENHEIT)
+        == "49°F (9°C)"
+    )
 
 
 def test_build_attributes() -> None:
@@ -304,16 +339,16 @@ def test_has_twice_daily_data_supported(tool: WeatherForecastTool) -> None:
 @pytest.mark.parametrize(
     ("state", "expected_result"),
     [
-        ("22.5", "- Time: current\n  Temperature: 22"),
-        ("23.9", "- Time: current\n  Temperature: 24"),
-        ("0.0", "- Time: current\n  Temperature: 0"),
-        ("100.1", "- Time: current\n  Temperature: 100"),
+        ("22.5", "- Time: current\n  Temperature: 22°C (72°F)"),
+        ("23.9", "- Time: current\n  Temperature: 24°C (75°F)"),
+        ("0.0", "- Time: current\n  Temperature: 0°C (32°F)"),
+        ("100.1", "- Time: current\n  Temperature: 100°C (212°F)"),
         ("unknown", ""),
         ("unavailable", ""),
         ("invalid", None),
-        ("-5.7", "- Time: current\n  Temperature: -6"),
-        ("22", "- Time: current\n  Temperature: 22"),
-        ("-10.0", "- Time: current\n  Temperature: -10"),
+        ("-5.7", "- Time: current\n  Temperature: -6°C (22°F)"),
+        ("22", "- Time: current\n  Temperature: 22°C (72°F)"),
+        ("-10.0", "- Time: current\n  Temperature: -10°C (14°F)"),
     ],
 )
 def test_get_current_temperature_sensor_data(
@@ -992,7 +1027,8 @@ async def test_async_call_prepends_current_conditions(hass: HomeAssistant) -> No
     text = result.data["result"]
     assert "- Time: current" in text
     assert "General Condition: partlycloudy" in text
-    assert "Feels Like: 20" in text
+    assert "Temperature: 22°C (71°F)" in text
+    assert "Feels Like: 20°C (68°F)" in text
     assert "Humidity: 78%" in text
     # Humidity is also reported inside the daily forecast itself.
     assert "Humidity: 65%" in text
@@ -1112,7 +1148,8 @@ async def test_async_call_location_uses_open_meteo(hass: HomeAssistant) -> None:
         "Weather for Orlando, Florida, United States (source: Open-Meteo, CC BY 4.0)"
     )
     assert "- Time: current" in text
-    assert "Temperature: 30" in text
+    assert "Temperature: 30°C (86°F)" in text
+    assert "Temperature: 22°C (72°F) - 31°C (88°F)" in text
     assert "Humidity: 70%" in text
     assert "Today (Sunday)" in text
     assert "- Time: 12am" in text
