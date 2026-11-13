@@ -15,7 +15,7 @@ from homeassistant.helpers import llm
 from homeassistant.helpers.llm import ToolResult
 
 from .base_tool import BaseTool
-from .utils import find_entity_by_name
+from .utils import EntityNotFoundError, find_entity_by_name, find_entity_candidates
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -107,24 +107,35 @@ class EntityHistoryTool(BaseTool):
         "- If the user wants to know when a person left or arrived home.\n"
         "For entities with a limited set of distinct states (such as location or presence sensors), the result's stats also include `state_durations`: the total time spent in each state during the search period. Use those totals, rather than estimating from the sampled states, when answering how long a device was in a state or which state it was in for most of a period.\n"
         "For numeric entities, the stats also include `time_weighted_avg`: the average value weighted by how long each value was held. Prefer it over the plain `avg` when answering what the average value was over a period.\n"
-        "Example queries: `What time did the kitchen reach 25 degrees?` `When was the bedroom light turned off?` `What was the temperature outside at 8am this morning?`"
+        "Questions about a period — an average, a total, how long something lasted, or which state lasted longest — must be answered from this tool's results, never from a current live state.\n"
+        "The entity is resolved flexibly: `name` does not have to be exact, and `domain`/`area` are hints rather than strict filters. If a call fails to resolve the entity, the error result lists the closest candidate entities — retry the call using one candidate's `entity_id` rather than guessing another name. If you already know the entity_id (for example from a previous result), pass `entity_id` directly.\n"
+        "If the user asks how long a numeric value spent above or below a level (for example, how long the temperature was above 25 degrees), pass that level as the `threshold` argument; the result's stats will then include `threshold_duration` with the computed time above and below the threshold. Use those totals rather than estimating from the sampled states.\n"
+        "Example queries: `What time did the kitchen reach 25 degrees?` `When was the bedroom light turned off?` `What was the temperature outside at 8am this morning?` `How long was it above 25 degrees today?`"
     )
     prompt_description = None
 
     parameters = vol.Schema(
         {
-            vol.Required(
+            vol.Optional(
                 "name",
-                description="The name of the entity or device to retrieve the history for, exactly as it appears in the static device context (case-insensitive).",
+                description="The name of the entity or device to retrieve the history for. It does not have to be exact — a partial name is resolved against the exposed entities — but an exact name from the device context is preferred. Omit only when passing `entity_id`.",
+            ): str,
+            vol.Optional(
+                "entity_id",
+                description="The exact entity_id of the entity to retrieve history for, as returned in a previous result's candidates. Preferred over `name` when known.",
             ): str,
             vol.Optional(
                 "area",
-                description="Filter entity by area name or alias (case-insensitive).",
+                description="Hint: the area name or alias of the entity (case-insensitive). Used to rank matches, not as a strict filter.",
             ): str,
-            vol.Required(
+            vol.Optional(
                 "domain",
-                description="Filter entity by the domain (case-insensitive).",
+                description="Hint: the entity's domain (case-insensitive). Used to rank matches, not as a strict filter.",
             ): str,
+            vol.Optional(
+                "threshold",
+                description="A numeric level for a 'how long above/below' question. When given for a numeric entity, the result's stats include `threshold_duration`: the computed time the value spent above and below this level during the search period.",
+            ): vol.Coerce(float),
             vol.Required(
                 "end_date_time",
                 description="The end date/time of the period to retrieve information from, in the format: `YYYY-MM-DD HH:MM`.",
@@ -310,6 +321,76 @@ class EntityHistoryTool(BaseTool):
         return round(weighted_sum / total_seconds, 2)
 
     @staticmethod
+    def _compute_threshold_duration(
+        states: list[State | dict[str, Any]],
+        window_start: datetime | None,
+        window_end: datetime | None,
+        threshold: float,
+    ) -> dict[str, Any] | None:
+        """
+        Compute how long a numeric entity spent above/below a threshold.
+
+        Each record's value is taken to last until the next record; the
+        first record is clamped to the window start and the final record
+        runs to the window end. Computed from the full sequence, not the
+        downsampled states. Records whose value is not numeric (unknown,
+        unavailable, a sensor gap) count as NEITHER above nor below —
+        the previous value is not extended over them — and the returned
+        percentages are shares of the known-value time only. A value
+        exactly equal to the threshold counts as neither above nor below.
+
+        Returns None when no known-value time can be derived.
+        """
+        points: list[tuple[float, float | None]] = []
+        for item in states:
+            ts = _state_timestamp(item)
+            if ts is None:
+                continue
+            try:
+                value: float | None = float(_state_value(item))
+            except (ValueError, TypeError):
+                value = None
+            points.append((ts, value))
+        if not points:
+            return None
+
+        points.sort(key=lambda point: point[0])
+
+        start_ts = (
+            window_start.timestamp() if window_start is not None else points[0][0]
+        )
+        end_ts = window_end.timestamp() if window_end is not None else points[-1][0]
+
+        above_seconds = 0.0
+        below_seconds = 0.0
+        known_seconds = 0.0
+        for i, (ts, value) in enumerate(points):
+            segment_start = max(ts, start_ts)
+            segment_end = points[i + 1][0] if i + 1 < len(points) else end_ts
+            segment_end = min(segment_end, end_ts)
+            if segment_end <= segment_start or value is None:
+                continue
+            duration = segment_end - segment_start
+            known_seconds += duration
+            if value > threshold:
+                above_seconds += duration
+            elif value < threshold:
+                below_seconds += duration
+
+        if known_seconds <= 0:
+            return None
+
+        return {
+            "threshold": threshold,
+            "above_seconds": round(above_seconds),
+            "above_minutes": round(above_seconds / 60, 1),
+            "above_percent": round(above_seconds / known_seconds * 100, 1),
+            "below_seconds": round(below_seconds),
+            "below_minutes": round(below_seconds / 60, 1),
+            "below_percent": round(below_seconds / known_seconds * 100, 1),
+        }
+
+    @staticmethod
     def _downsample(
         raw_states: list[State | dict[str, Any]], max_count: int
     ) -> list[State | dict[str, Any]]:
@@ -359,6 +440,64 @@ class EntityHistoryTool(BaseTool):
         sorted_indices = sorted(selected)
         return [raw_states[i] for i in sorted_indices]
 
+    @staticmethod
+    def _resolve_entity(
+        hass: HomeAssistant,
+        tool_args: dict[str, Any],
+        exposed_entities: dict[str, dict[str, Any]],
+    ) -> tuple[str, str]:
+        """
+        Resolve the requested entity to (entity_id, display name).
+
+        An explicit entity_id wins and must be exposed. Otherwise the
+        name is resolved by find_entity_by_name (exact, then ranked).
+        With neither, raises EntityNotFoundError carrying the exposed
+        entities matching the area/domain hints as browse candidates.
+        """
+        entity_id_arg = tool_args.get("entity_id")
+        entity_name = tool_args.get("name")
+        area = tool_args.get("area")
+        domain = tool_args.get("domain")
+
+        if entity_id_arg:
+            if entity_id_arg not in exposed_entities:
+                msg = f"Entity '{entity_id_arg}' is not exposed"
+                raise EntityNotFoundError(
+                    msg,
+                    candidates=find_entity_candidates(
+                        hass,
+                        entity_name or entity_id_arg,
+                        domain,
+                        area,
+                        exposed_entities=exposed_entities,
+                    ),
+                )
+            return entity_id_arg, exposed_entities[entity_id_arg].get(
+                "names"
+            ) or entity_id_arg
+
+        if entity_name:
+            entity = find_entity_by_name(
+                hass,
+                entity_name,
+                exposed_entities=exposed_entities,
+                area=area,
+                domain=domain,
+            )
+            return entity.entity_id, entity.name or entity.entity_id
+
+        msg = "No entity name or entity_id was given"
+        raise EntityNotFoundError(
+            msg,
+            candidates=find_entity_candidates(
+                hass,
+                None,
+                domain,
+                area,
+                exposed_entities=exposed_entities,
+            ),
+        )
+
     async def async_call(
         self,
         hass: HomeAssistant,
@@ -366,9 +505,12 @@ class EntityHistoryTool(BaseTool):
         llm_context: llm.LLMContext,
     ) -> ToolResult:
         """Return state change history of the device entity."""
-        entity_name = tool_input.tool_args.get("name")
-        area = tool_input.tool_args.get("area")
-        domain = tool_input.tool_args.get("domain")
+        threshold = tool_input.tool_args.get("threshold")
+        if threshold is not None:
+            try:
+                threshold = float(threshold)
+            except (ValueError, TypeError):
+                threshold = None
         start_time = tool_input.tool_args.get("start_date_time")
         end_time = tool_input.tool_args.get("end_date_time")
 
@@ -381,14 +523,9 @@ class EntityHistoryTool(BaseTool):
                 hass, llm_context.assistant, include_state=False
             )
 
-            entity = find_entity_by_name(
-                hass,
-                entity_name,
-                exposed_entities=exposed_entities,
-                area=area,
-                domain=domain,
+            entity_id, resolved_name = self._resolve_entity(
+                hass, tool_input.tool_args, exposed_entities
             )
-            entity_id = entity.entity_id
 
             start_time = _to_datetime(start_time)
             end_time = _to_datetime(end_time)
@@ -419,10 +556,31 @@ class EntityHistoryTool(BaseTool):
                 if not sublist:
                     continue
                 results = self._process_entity_states(
-                    sublist, results, start_time, effective_end
+                    sublist, results, start_time, effective_end, threshold
                 )
 
+            if results:
+                # Name the entity the history was resolved to, so the
+                # choice is auditable — but keep an empty result empty.
+                results = {
+                    "entity_id": entity_id,
+                    "entity_name": resolved_name,
+                    **results,
+                }
+
             return ToolResult(data=results)
+        except EntityNotFoundError as err:
+            return ToolResult(
+                data={
+                    "error": str(err),
+                    "candidates": err.candidates,
+                    "hint": (
+                        "Retry the call with one candidate's exact "
+                        "entity_id in the `entity_id` argument."
+                    ),
+                },
+                error=True,
+            )
         except Exception as e:
             _LOGGER.exception("Entity history encountered an error")
             return ToolResult(
@@ -435,6 +593,7 @@ class EntityHistoryTool(BaseTool):
         results: dict[str, Any],
         window_start: datetime | None = None,
         window_end: datetime | None = None,
+        threshold: float | None = None,
     ) -> dict[str, Any]:
         """Process a single entity's state list into LLM-friendly format."""
         start_state = sublist[0]
@@ -465,6 +624,17 @@ class EntityHistoryTool(BaseTool):
         )
         if time_weighted_avg is not None:
             result["stats"]["time_weighted_avg"] = time_weighted_avg
+
+        # Threshold durations are computed from the full sequence
+        # (including the start record and any unknown/unavailable
+        # periods) so "how long above/below X" questions are answered
+        # from computed totals, not estimated over the sampled states.
+        if threshold is not None:
+            threshold_duration = self._compute_threshold_duration(
+                sublist, window_start, window_end, threshold
+            )
+            if threshold_duration is not None:
+                result["stats"]["threshold_duration"] = threshold_duration
 
         return result
 
