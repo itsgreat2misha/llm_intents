@@ -501,18 +501,23 @@ async def test_osm_fallback_on_http_error(
         assert isinstance(result, ToolResult)
 
     assert result.data == {"results": [OSM_COSTCO_RESULT]}
-    # The first Nominatim lookup is bounded to the home area.
+    # The first Nominatim lookup is the small bounded box around home
+    # (fixture home: 40.0, -74.0), and a hit there stops the search —
+    # no wider fetch is made.
+    assert session.get.call_count == 1
     first_get_params = session.get.call_args_list[0].kwargs["params"]
     assert first_get_params["bounded"] == 1
-    assert "viewbox" in first_get_params
+    assert first_get_params["limit"] == 50
+    viewbox = [float(part) for part in first_get_params["viewbox"].split(",")]
+    assert viewbox == pytest.approx([-74.1, 40.1, -73.9, 39.9])
 
 
-async def test_osm_fallback_when_bounded_empty(
+async def test_osm_fallback_widens_when_small_box_empty(
     tool: FindPlacesTool,
     places_hass: HomeAssistant,
     cache_miss: Any,
 ) -> None:
-    """An empty bounded search retries unbounded before giving up."""
+    """An empty small-box search widens to the larger bounded box."""
     session = _make_session(
         {PLACES_URL: {"status": 403, "data": {"error": "denied"}}},
         get_responses=[(200, []), (200, [OSM_COSTCO])],
@@ -527,7 +532,33 @@ async def test_osm_fallback_when_bounded_empty(
     assert result.data == {"results": [OSM_COSTCO_RESULT]}
     assert session.get.call_count == 2
     second_get_params = session.get.call_args_list[1].kwargs["params"]
-    assert "bounded" not in second_get_params
+    assert second_get_params["bounded"] == 1
+    viewbox = [float(part) for part in second_get_params["viewbox"].split(",")]
+    assert viewbox == pytest.approx([-74.5, 40.5, -73.5, 39.5])
+
+
+async def test_osm_fallback_unbounded_when_bounded_empty(
+    tool: FindPlacesTool,
+    places_hass: HomeAssistant,
+    cache_miss: Any,
+) -> None:
+    """When both bounded stages are empty, the search retries unbounded."""
+    session = _make_session(
+        {PLACES_URL: {"status": 403, "data": {"error": "denied"}}},
+        get_responses=[(200, []), (200, []), (200, [OSM_COSTCO])],
+    )
+
+    with patch(
+        "custom_components.llm_intents.google_places.async_get_clientsession",
+        return_value=session,
+    ):
+        result = await tool.async_call(places_hass, _tool_input(query="Costco"), Mock())
+
+    assert result.data == {"results": [OSM_COSTCO_RESULT]}
+    assert session.get.call_count == 3
+    third_get_params = session.get.call_args_list[2].kwargs["params"]
+    assert "bounded" not in third_get_params
+    assert "viewbox" not in third_get_params
 
 
 async def test_osm_fallback_without_api_key(

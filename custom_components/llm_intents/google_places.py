@@ -83,7 +83,7 @@ class FindPlacesTool(BaseTool):
             "addressdetails": 1,
             "extratags": 1,
             "namedetails": 1,
-            "limit": 10,
+            "limit": 50,
             "accept-language": "en",
         }
         session = async_get_clientsession(hass)
@@ -106,10 +106,21 @@ class FindPlacesTool(BaseTool):
 
         data = []
         if lat is not None and lon is not None:
-            # Search the home area first (bounded): Nominatim's prominence
-            # ranking otherwise buries the nearest match for chain names.
-            viewbox = f"{lon - 0.5},{lat + 0.5},{lon + 0.5},{lat - 0.5}"
-            data = await _fetch({"viewbox": viewbox, "bounded": 1})
+            # Search in stages, smallest area first. Nominatim ranks by
+            # prominence rather than distance and returns at most 50
+            # results, so in a wide area the nearest match for a chain
+            # name may never make it into the results at all. A small box
+            # around home holds few enough matches for the pool to be
+            # complete; only widen the search when a stage comes back
+            # empty, and fall back to an unbounded search last.
+            for half_side in (0.1, 0.5):
+                viewbox = (
+                    f"{lon - half_side},{lat + half_side},"
+                    f"{lon + half_side},{lat - half_side}"
+                )
+                data = await _fetch({"viewbox": viewbox, "bounded": 1})
+                if data:
+                    break
         if not data:
             data = await _fetch({})
 
