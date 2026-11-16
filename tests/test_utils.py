@@ -173,11 +173,10 @@ def test_find_no_entity_entry() -> None:
     [
         # Domain match
         ("light.living_room", "Living Room", "light", _EXPOSED_ENTITIES, False),
-        # Domain mismatch: an exact name match is rescued by the ranked
-        # stage — domain is a hint, not a hard filter.
-        ("light.living_room", "Living Room", "sensor", _EXPOSED_ENTITIES, False),
-        # Area mismatch: same — the exact entity_id beats a wrong area hint.
-        ("light.living_room", "Kitchen", "light", _EXPOSED_ENTITIES, False),
+        # Domain mismatch
+        ("light.living_room", "Living Room", "sensor", _EXPOSED_ENTITIES, True),
+        # Area mismatch
+        ("light.living_room", "Kitchen", "light", _EXPOSED_ENTITIES, True),
         # Exposed entities filter: entity not in dict
         (
             "light.living_room",
@@ -205,13 +204,13 @@ def test_find_no_entity_entry() -> None:
             },
             True,
         ),
-        # Exact entity_id with a wrong area hint: rescued by the ranked stage
+        # Filtered out entirely
         (
             "sensor.kitchen_temperature",
             "Living Room",
             "sensor",
             _EXPOSED_ENTITIES,
-            False,
+            True,
         ),
     ],
 )
@@ -223,7 +222,7 @@ def test_find_filters(
     exposed: dict,
     expect_error: bool,
 ) -> None:
-    """Test domain/area filtering and ranked rescue of exact matches."""
+    """Test domain, area, and exposed_entities filtering."""
     if expect_error:
         with pytest.raises(EntityNotFoundError):
             find_entity_by_name(
@@ -245,36 +244,168 @@ def test_find_filters(
 
 
 # ---------------------------------------------------------------------------
-# Ranked resolution (stage 2)
+# Failed lookups: candidates are suggested, never picked automatically
 # ---------------------------------------------------------------------------
 
 
-def test_ranked_subset_name(hass_with_entities: HomeAssistant) -> None:
-    """A query naming a subset of the entity's name resolves to it."""
-    result = find_entity_by_name(
+def test_partial_name_raises_with_ordered_candidates(
+    hass_with_entities: HomeAssistant,
+) -> None:
+    """
+    A partial name never resolves; it raises with candidates.
+
+    The candidates come from the filtered set, ordered by plain name
+    similarity: "Kitchen Temp" is closest to "Kitchen Temperature",
+    and its candidate score is the raw name match (42.6) — the
+    confirmed area adds nothing, because the score only orders the
+    suggestions; nothing is ever picked automatically.
+    """
+    with pytest.raises(EntityNotFoundError) as excinfo:
+        find_entity_by_name(
+            hass_with_entities,
+            "Kitchen Temp",
+            area="Kitchen",
+            domain="sensor",
+            exposed_entities=_EXPOSED_ENTITIES,
+        )
+    candidates = excinfo.value.candidates
+    assert candidates[0]["entity_id"] == "sensor.kitchen_temperature"
+    assert candidates[0]["score"] == pytest.approx(42.6, abs=0.15)
+    scores = [c["score"] for c in candidates]
+    assert scores == sorted(scores, reverse=True)
+
+
+def test_subset_name_raises_with_candidate(
+    hass_with_entities: HomeAssistant,
+) -> None:
+    """A query naming a subset of an entity's name raises, suggesting it."""
+    with pytest.raises(EntityNotFoundError) as excinfo:
+        find_entity_by_name(
+            hass_with_entities,
+            "Garage",
+            area=None,
+            domain="switch",
+            exposed_entities=_EXPOSED_ENTITIES,
+        )
+    assert excinfo.value.candidates[0]["entity_id"] == "switch.garage_door"
+
+
+def test_strong_partial_name_is_not_picked() -> None:
+    """
+    Even a strong partial match is not picked automatically.
+
+    "Kitchen Temperature Sensor Unit" is closest by a wide margin to
+    "Kitchen Temperature Average", but it is not an exact match, so
+    the lookup raises and suggests that entity as a candidate.
+    """
+    hass = MagicMock()
+    hass.states.async_all.return_value = [
+        State(
+            "sensor.kitchen_temperature_average",
+            "21.0",
+            attributes={
+                "friendly_name": "Kitchen Temperature Average",
+                "device_class": "temperature",
+            },
+        ),
+    ]
+    exposed = {
+        "sensor.kitchen_temperature_average": {
+            "names": "Kitchen Temperature Average",
+            "domain": "sensor",
+            "areas": "Kitchen",
+        },
+    }
+
+    def aliases(
+        _h: object, _entry: object, state: State | None = None, **_k: object
+    ) -> list[str]:
+        return [state.attributes["friendly_name"]] if state is not None else []
+
+    with (
+        patch("custom_components.llm_intents.utils.er.async_get") as mock_get,
+        patch(
+            "custom_components.llm_intents.utils.intent.async_get_entity_aliases",
+            side_effect=aliases,
+        ),
+    ):
+        mock_get.return_value.async_get.return_value = MagicMock()
+        with pytest.raises(EntityNotFoundError) as excinfo:
+            find_entity_by_name(
+                hass,
+                "Kitchen Temperature Sensor Unit",
+                area="Kitchen",
+                domain="sensor",
+                exposed_entities=exposed,
+            )
+    assert (
+        excinfo.value.candidates[0]["entity_id"] == "sensor.kitchen_temperature_average"
+    )
+
+
+def test_exact_name_wrong_area_fails(hass_with_entities: HomeAssistant) -> None:
+    """An exact name match still fails when the area filter is wrong."""
+    with pytest.raises(EntityNotFoundError):
+        find_entity_by_name(
+            hass_with_entities,
+            "Living Room Light",
+            area="Kitchen",
+            domain="light",
+            exposed_entities=_EXPOSED_ENTITIES,
+        )
+
+
+def test_exact_name_wrong_domain_fails(hass_with_entities: HomeAssistant) -> None:
+    """An exact name match still fails when the domain filter is wrong."""
+    with pytest.raises(EntityNotFoundError):
+        find_entity_by_name(
+            hass_with_entities,
+            "Living Room Light",
+            area="Living Room",
+            domain="sensor",
+            exposed_entities=_EXPOSED_ENTITIES,
+        )
+
+
+def test_partial_name_wrong_area_fails(
+    hass_with_entities: HomeAssistant,
+) -> None:
+    """A partial name is not rescued across areas; it still fails."""
+    with pytest.raises(EntityNotFoundError):
+        find_entity_by_name(
+            hass_with_entities,
+            "Kitchen Temp",
+            area="Living Room",
+            domain="sensor",
+            exposed_entities=_EXPOSED_ENTITIES,
+        )
+
+
+def test_candidates_respect_filters(hass_with_entities: HomeAssistant) -> None:
+    """Candidates never include entities outside the supplied filters."""
+    with pytest.raises(EntityNotFoundError) as excinfo:
+        find_entity_by_name(
+            hass_with_entities,
+            "Kitchen Temperature",
+            domain="light",
+            exposed_entities=_EXPOSED_ENTITIES,
+        )
+    assert all(c["domain"] == "light" for c in excinfo.value.candidates)
+    assert "sensor.kitchen_temperature" not in {
+        c["entity_id"] for c in excinfo.value.candidates
+    }
+
+    candidates = find_entity_candidates(
         hass_with_entities,
-        "Garage",
-        area=None,
-        domain="switch",
+        "Temperature",
+        domain="light",
         exposed_entities=_EXPOSED_ENTITIES,
     )
-    assert result.entity_id == "switch.garage_door"
+    assert "sensor.kitchen_temperature" not in {c["entity_id"] for c in candidates}
 
 
-def test_ranked_fuzzy_name(hass_with_entities: HomeAssistant) -> None:
-    """A shortened name resolves via fuzzy matching when unambiguous."""
-    result = find_entity_by_name(
-        hass_with_entities,
-        "Kitchen Temp",
-        area="Kitchen",
-        domain="sensor",
-        exposed_entities=_EXPOSED_ENTITIES,
-    )
-    assert result.entity_id == "sensor.kitchen_temperature"
-
-
-def test_ranked_candidates_helper(hass_with_entities: HomeAssistant) -> None:
-    """find_entity_candidates ranks the kitchen sensor first for a partial name."""
+def test_candidates_helper(hass_with_entities: HomeAssistant) -> None:
+    """find_entity_candidates orders the kitchen sensor first for a partial name."""
     candidates = find_entity_candidates(
         hass_with_entities,
         "Kitchen Temp",
@@ -297,10 +428,41 @@ def test_browse_candidates_without_name(hass_with_entities: HomeAssistant) -> No
     assert [c["entity_id"] for c in candidates] == ["sensor.kitchen_temperature"]
 
 
-def test_empty_name_raises_with_browse_candidates(
+def test_candidate_dict_shape_is_the_same_for_browse_and_ranked(
     hass_with_entities: HomeAssistant,
 ) -> None:
-    """An empty name raises, carrying browse candidates for the domain."""
+    """
+    Browse-mode and ranked candidates carry identical keys.
+
+    Ranked candidates have a numeric score; a browse has no query
+    name to score against, so its score is None — but the dict shape
+    is the same either way.
+    """
+    ranked = find_entity_candidates(
+        hass_with_entities,
+        "Kitchen Temp",
+        domain="sensor",
+        exposed_entities=_EXPOSED_ENTITIES,
+    )
+    browse = find_entity_candidates(
+        hass_with_entities,
+        None,
+        domain="sensor",
+        exposed_entities=_EXPOSED_ENTITIES,
+    )
+    assert ranked
+    assert browse
+    assert {key for candidate in ranked for key in candidate} == {
+        key for candidate in browse for key in candidate
+    }
+    assert all(isinstance(c["score"], float) for c in ranked)
+    assert all(c["score"] is None for c in browse)
+
+
+def test_empty_name_raises_without_candidates(
+    hass_with_entities: HomeAssistant,
+) -> None:
+    """An empty name matches nothing exactly and raises with no candidates."""
     with pytest.raises(EntityNotFoundError) as excinfo:
         find_entity_by_name(
             hass_with_entities,
@@ -308,12 +470,10 @@ def test_empty_name_raises_with_browse_candidates(
             domain="sensor",
             exposed_entities=_EXPOSED_ENTITIES,
         )
-    assert [c["entity_id"] for c in excinfo.value.candidates] == [
-        "sensor.kitchen_temperature"
-    ]
+    assert excinfo.value.candidates == []
 
 
-def test_ranked_ambiguous_raises_with_candidates() -> None:
+def test_ambiguous_name_raises_with_candidates() -> None:
     """Two equally good matches are not silently picked; both are returned."""
     hass = MagicMock()
     hass.states.async_all.return_value = [

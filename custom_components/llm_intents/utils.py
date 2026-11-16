@@ -14,7 +14,7 @@ class EntityNotFoundError(HomeAssistantError):
     """
     Exception raised when an entity is not found.
 
-    Carries the closest ranked candidates (if any) so the caller can
+    Carries the closest candidates (if any) so the caller can
     present them for an exact retry instead of failing blind.
     """
 
@@ -23,17 +23,18 @@ class EntityNotFoundError(HomeAssistantError):
         message: str = "Entity not found",
         candidates: list[dict[str, Any]] | None = None,
     ) -> None:
-        """Initialize the exception, optionally with ranked candidates."""
+        """Initialize the exception, optionally with candidates."""
         super().__init__(message)
         self.candidates: list[dict[str, Any]] = candidates or []
 
 
-# Minimum ranked score for a non-exact match to be accepted, and the
-# minimum lead it must hold over the runner-up. Both are deliberately
-# conservative: a wrong silent pick is worse than returning candidates
-# and letting the caller retry with an exact entity_id.
-MIN_MATCH_SCORE = 55.0
-MIN_MATCH_MARGIN = 12.0
+# Resolution is exact-match only, like Home Assistant itself: a name
+# either matches an exposed entity's id, name or alias exactly or the
+# lookup fails. On a failure, the closest entities that pass the
+# domain/area filters are returned as candidates, ordered by plain
+# name similarity (see _score_name) — nothing is ever picked
+# automatically; the caller retries with a candidate's exact
+# entity_id.
 
 # Maximum number of candidate entities returned on a failed lookup.
 MAX_CANDIDATES = 5
@@ -89,6 +90,30 @@ def _score_name(query_norm: str, query_tokens: set[str], candidate_name: str) ->
     return max(token_score, fuzzy_score)
 
 
+def _passes_filters(
+    state: State,
+    domain_norm: str | None,
+    area_norm: str | None,
+    exposed_entities: dict[str, dict[str, Any]],
+) -> bool:
+    """
+    Apply the domain/area filters exactly as the exact-match stage does.
+
+    Both are hard filters, matching Home Assistant's own Assist
+    behavior: when a domain is given, only that domain passes; when an
+    area is given, an entity with recorded areas passes only if the
+    area is among them (an entity with no recorded areas is not
+    excluded).
+    """
+    if domain_norm is not None and state.domain != domain_norm:
+        return False
+    if area_norm is not None:
+        entity_areas = _entity_areas(exposed_entities, state.entity_id)
+        if entity_areas and area_norm not in entity_areas:
+            return False
+    return True
+
+
 def _ranked_matches(
     hass: HomeAssistant,
     entity_name: str,
@@ -97,13 +122,16 @@ def _ranked_matches(
     exposed_entities: dict[str, dict[str, Any]],
 ) -> list[tuple[float, State, str]]:
     """
-    Score every exposed entity against the query name.
+    Score the exposed entities that pass the filters against the name.
 
-    Returns (score, state, display name) tuples, best first. Only
-    exposed entities are ever considered — exposure remains the
-    permission boundary. Domain and area are scoring boosts here,
-    not hard filters: a model that guesses the wrong domain should
-    not lose an otherwise unambiguous name match.
+    Returns (score, state, display name) tuples, best first. Domain
+    and area are hard filters, applied before scoring: an entity
+    outside the requested domain or area is never scored or returned
+    as a candidate. The score is the plain name similarity (see
+    _score_name) and is used only to order the candidates on a failed
+    lookup — it never selects an entity by itself. Only exposed
+    entities are ever considered — exposure remains the permission
+    boundary.
     """
     query_norm = _normalize(entity_name)
     query_tokens = set(_tokens(entity_name))
@@ -113,6 +141,8 @@ def _ranked_matches(
     scored: list[tuple[float, State, str]] = []
     for state in hass.states.async_all():
         if state.entity_id not in exposed_entities:
+            continue
+        if not _passes_filters(state, domain_norm, area_norm, exposed_entities):
             continue
 
         entity_entry = er.async_get(hass).async_get(state.entity_id)
@@ -126,15 +156,6 @@ def _ranked_matches(
         if score <= 0:
             continue
 
-        if domain_norm and state.domain == domain_norm:
-            score += 8.0
-        areas = _entity_areas(exposed_entities, state.entity_id)
-        if area_norm and area_norm in areas:
-            score += 8.0
-        device_class = state.attributes.get("device_class")
-        if device_class and device_class in query_tokens:
-            score += 5.0
-
         display_name = next(
             (name for name in check_names if name != state.entity_id),
             state.entity_id,
@@ -146,11 +167,16 @@ def _ranked_matches(
 
 
 def _candidate_dicts(
-    ranked: list[tuple[float, State, str]],
+    ranked: list[tuple[float | None, State, str]],
     exposed_entities: dict[str, dict[str, Any]],
     limit: int,
 ) -> list[dict[str, Any]]:
-    """Format ranked matches as LLM-friendly candidate dicts."""
+    """
+    Format matches as LLM-friendly candidate dicts.
+
+    Every candidate carries the same keys; the score is None when
+    there was no query name to score the match against (a browse).
+    """
     candidates: list[dict[str, Any]] = []
     for score, state, display_name in ranked[:limit]:
         entity_info = exposed_entities.get(state.entity_id) or {}
@@ -160,7 +186,7 @@ def _candidate_dicts(
                 "name": display_name,
                 "domain": state.domain,
                 "areas": entity_info.get("areas"),
-                "score": round(score, 1),
+                "score": round(score, 1) if score is not None else None,
             }
         )
     return candidates
@@ -177,9 +203,10 @@ def find_entity_candidates(
     """
     Return the closest exposed entities to a (possibly partial) name.
 
-    With no name, this is a browse: exposed entities matching the
-    domain/area filters are returned in state order. Unexposed
-    entities are never included.
+    Candidates only ever come from the entities that pass the
+    domain/area filters. With no name, this is a browse: exposed
+    entities passing the filters are returned in state order.
+    Unexposed entities are never included.
     """
     if entity_name:
         ranked = _ranked_matches(hass, entity_name, domain, area, exposed_entities)
@@ -187,34 +214,23 @@ def find_entity_candidates(
 
     domain_norm = domain.lower().strip() if domain else None
     area_norm = area.lower().strip() if area else None
-    candidates: list[dict[str, Any]] = []
+    browse: list[tuple[float | None, State, str]] = []
     for state in hass.states.async_all():
         if state.entity_id not in exposed_entities:
             continue
-        if domain_norm and state.domain != domain_norm:
-            continue
-        if area_norm and area_norm not in _entity_areas(
-            exposed_entities, state.entity_id
-        ):
+        if not _passes_filters(state, domain_norm, area_norm, exposed_entities):
             continue
         entity_info = exposed_entities.get(state.entity_id) or {}
-        candidates.append(
-            {
-                "entity_id": state.entity_id,
-                "name": entity_info.get("names") or state.entity_id,
-                "domain": state.domain,
-                "areas": entity_info.get("areas"),
-            }
-        )
-        if len(candidates) >= MAX_CANDIDATES:
+        browse.append((None, state, entity_info.get("names") or state.entity_id))
+        if len(browse) >= MAX_CANDIDATES:
             break
-    return candidates
+    return _candidate_dicts(browse, exposed_entities, MAX_CANDIDATES)
 
 
 def find_entity_by_name(
     hass: HomeAssistant,
     entity_name: str,
-    domain: str | None = None,
+    domain: str,
     area: str | None = None,
     *,
     exposed_entities: dict[str, dict[str, Any]],
@@ -222,42 +238,36 @@ def find_entity_by_name(
     """
     Find an entity by its name or aliases.
 
-    Resolution runs in two stages:
-
-    1. Exact normalized match against the entity id, friendly name or
-       aliases, within the domain/area filters when given (the
-       historical behaviour).
-    2. Ranked matching over all exposed entities, where domain/area
-       act as boosts rather than hard filters. A ranked match is only
-       accepted when it scores at least MIN_MATCH_SCORE and leads the
-       runner-up by MIN_MATCH_MARGIN — anything closer is ambiguous
-       and raises EntityNotFoundError carrying the ranked candidates
-       so the caller can retry with an exact entity_id.
+    An exact normalized match against the entity id, friendly name
+    or aliases, with domain and area as hard filters. On a miss,
+    EntityNotFoundError is raised carrying the closest candidates
+    from the entities that pass the same filters, ordered by name
+    similarity, so the caller can retry with a candidate's exact
+    entity_id. Nothing is ever picked automatically.
     """
-    if not entity_name or not entity_name.strip():
-        msg = "No entity name given"
-        raise EntityNotFoundError(
-            msg,
-            candidates=find_entity_candidates(
-                hass, None, domain, area, exposed_entities=exposed_entities
-            ),
-        )
-
     entity_name_norm = entity_name.lower().strip()
-    domain_norm = domain.lower().strip() if domain else None
-    area_norm = area.lower().strip() if area else None
+    domain = domain.lower().strip()
 
-    # Stage 1: exact match within the supplied filters.
     for state in hass.states.async_all():
+        # Exposed entities filter
         if state.entity_id not in exposed_entities:
             continue
-        if domain_norm and state.domain != domain_norm:
-            continue
-        if area_norm and area_norm not in _entity_areas(
-            exposed_entities, state.entity_id
-        ):
+
+        # Domain filter
+        if state.domain != domain:
             continue
 
+        # Area filter
+        if area is not None:
+            area = area.lower().strip()
+            entity_info = exposed_entities[state.entity_id]
+            entity_areas = entity_info.get("areas")
+            if entity_areas:
+                area_list = [a.lower().strip() for a in entity_areas.split(", ")]
+                if area not in area_list:
+                    continue
+
+        # Name matching
         entity_entry = er.async_get(hass).async_get(state.entity_id)
         names = intent.async_get_entity_aliases(hass, entity_entry, state=state)
         check_names = [state.entity_id, *names]
@@ -265,13 +275,9 @@ def find_entity_by_name(
             if name.lower().strip() == entity_name_norm:
                 return state
 
-    # Stage 2: ranked match, filters relaxed to boosts.
+    # No exact match: fail, suggesting the closest candidates from
+    # the filtered set. Nothing is picked automatically.
     ranked = _ranked_matches(hass, entity_name, domain, area, exposed_entities)
-    if ranked:
-        top_score, top_state, _ = ranked[0]
-        runner_up = ranked[1][0] if len(ranked) > 1 else 0.0
-        if top_score >= MIN_MATCH_SCORE and (top_score - runner_up) >= MIN_MATCH_MARGIN:
-            return top_state
 
     msg = f"No exposed entity matched '{entity_name}'"
     raise EntityNotFoundError(

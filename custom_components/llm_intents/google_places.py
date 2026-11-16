@@ -4,14 +4,13 @@ import logging
 import re
 from http import HTTPStatus
 
-import voluptuous as vol
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import llm
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.llm import ToolResult
 from homeassistant.util import dt
 
-from .base_tool import BaseTool
+from .base_places import FindPlacesBaseTool
 from .cache import InMemoryCache
 from .const import (
     CONF_GOOGLE_PLACES_LATITUDE,
@@ -27,188 +26,8 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 
-class FindPlacesTool(BaseTool):
-    """Tool for finding places."""
-
-    name = "find_places"
-
-    description = (
-        "Use this tool to search Google Places when the user requests or infers they are after any of the following information for a business or location:\n"
-        "- Address\n"
-        "- Contact telephone number\n"
-        "- Regular Open & Close times\n"
-        "- Average user rating"
-    )
-
-    prompt_description = (
-        f"Use the `{name}` tool to search for information about a business or public location:\n"
-        "- This includes address, phone number, and opening hours."
-    )
-
-    response_directive = (
-        "Use the search results to answer the users query.\n"
-        "Focus on answering the users request directly, rather than repeating the entirety of the results to them."
-    )
-
-    parameters = vol.Schema(
-        {
-            vol.Required(
-                "query",
-                description="The place or location to search for",
-            ): str,
-        },
-    )
-
-    async def _search_openstreetmap(
-        self,
-        hass: HomeAssistant,
-        query: str,
-        latitude: float | None,
-        longitude: float | None,
-        num_results: int,
-    ) -> list:
-        """
-        Search OpenStreetMap (Nominatim) for places, including opening hours.
-
-        Data is ODbL (c) OpenStreetMap contributors. Nominatim's usage policy
-        requires an identifying User-Agent and light, non-bulk use, which a
-        voice assistant's occasional lookups satisfy.
-        """
-        lat = latitude or hass.config.latitude
-        lon = longitude or hass.config.longitude
-
-        base_params = {
-            "q": query,
-            "format": "jsonv2",
-            "addressdetails": 1,
-            "extratags": 1,
-            "namedetails": 1,
-            "limit": 50,
-            "accept-language": "en",
-        }
-        session = async_get_clientsession(hass)
-
-        async def _fetch(extra: dict) -> list:
-            async with session.get(
-                "https://nominatim.openstreetmap.org/search",
-                params={**base_params, **extra},
-                headers={
-                    "User-Agent": "HomeAssistant-llm_intents (personal home automation)",
-                },
-            ) as resp:
-                if resp.status != HTTPStatus.OK:
-                    _LOGGER.warning(
-                        "OpenStreetMap search returned HTTP %s",
-                        resp.status,
-                    )
-                    return []
-                return await resp.json()
-
-        data = []
-        if lat is not None and lon is not None:
-            # Search in stages, smallest area first. Nominatim ranks by
-            # prominence rather than distance and returns at most 50
-            # results, so in a wide area the nearest match for a chain
-            # name may never make it into the results at all. A small box
-            # around home holds few enough matches for the pool to be
-            # complete; only widen the search when a stage comes back
-            # empty, and fall back to an unbounded search last.
-            for half_side in (0.1, 0.5):
-                viewbox = (
-                    f"{lon - half_side},{lat + half_side},"
-                    f"{lon + half_side},{lat - half_side}"
-                )
-                data = await _fetch({"viewbox": viewbox, "bounded": 1})
-                if data:
-                    break
-        if not data:
-            data = await _fetch({})
-
-        if lat is not None and lon is not None:
-
-            def _distance_sq(place: dict) -> float:
-                try:
-                    plat = float(place["lat"])
-                    plon = float(place["lon"])
-                except (KeyError, TypeError, ValueError):
-                    return float("inf")
-                return (plat - lat) ** 2 + (plon - lon) ** 2
-
-            data = sorted(data, key=_distance_sq)
-        data = data[:num_results]
-
-        results = []
-        for place in data:
-            extratags = place.get("extratags") or {}
-            address = place.get("address") or {}
-            street = " ".join(
-                part
-                for part in [address.get("house_number"), address.get("road")]
-                if part
-            )
-            city = (
-                address.get("city")
-                or address.get("town")
-                or address.get("village")
-                or address.get("hamlet")
-            )
-            address_str = ", ".join(
-                part
-                for part in [
-                    street,
-                    city,
-                    address.get("state"),
-                    address.get("postcode"),
-                ]
-                if part
-            )
-            this_place = {
-                "name": (place.get("namedetails") or {}).get("name")
-                or place.get("display_name", "").split(",")[0],
-                "address": address_str or place.get("display_name", ""),
-                "rating": "Not rated",
-                "phone": extratags.get("phone")
-                or extratags.get("contact:phone")
-                or "Not available",
-                "source": "OpenStreetMap",
-            }
-            if extratags.get("opening_hours"):
-                this_place["opening_hours"] = extratags["opening_hours"]
-            website = extratags.get("website") or extratags.get("contact:website")
-            if website:
-                this_place["website"] = website
-            results.append(this_place)
-
-        return results
-
-    async def _osm_fallback_or(
-        self,
-        error: ToolResult,
-        hass: HomeAssistant,
-        tool_input: llm.ToolInput,
-    ) -> ToolResult:
-        """Return OpenStreetMap results if available, else the given error."""
-        try:
-            config_data = self.config
-            num_results = int(
-                config_data.get(
-                    CONF_GOOGLE_PLACES_NUM_RESULTS,
-                    SERVICE_DEFAULTS.get(CONF_GOOGLE_PLACES_NUM_RESULTS),
-                ),
-            )
-            results = await self._search_openstreetmap(
-                hass,
-                tool_input.tool_args["query"],
-                config_data.get(CONF_GOOGLE_PLACES_LATITUDE),
-                config_data.get(CONF_GOOGLE_PLACES_LONGITUDE),
-                num_results,
-            )
-        except Exception:
-            _LOGGER.exception("OpenStreetMap fallback encountered an error")
-            results = []
-        if results:
-            return ToolResult(data={"results": results})
-        return error
+class FindPlacesTool(FindPlacesBaseTool):
+    """Tool for finding places via Google Places."""
 
     async def async_call(
         self,
@@ -241,12 +60,8 @@ class FindPlacesTool(BaseTool):
         ).upper()
 
         if not api_key:
-            return await self._osm_fallback_or(
-                ToolResult(
-                    data={"error": "Google Places API key not configured"}, error=True
-                ),
-                hass,
-                tool_input,
+            return ToolResult(
+                data={"error": "Google Places API key not configured"}, error=True
             )
 
         try:
@@ -358,19 +173,12 @@ class FindPlacesTool(BaseTool):
 
                 error_msg = f"Places search received a HTTP {resp.status} error from Google: {await resp.text()}"
                 _LOGGER.error(error_msg)
-                return await self._osm_fallback_or(
-                    ToolResult(
-                        data={"error": f"Places search error: {resp.status}"},
-                        error=True,
-                    ),
-                    hass,
-                    tool_input,
+                return ToolResult(
+                    data={"error": f"Places search error: {resp.status}"}, error=True
                 )
 
         except Exception as e:
             _LOGGER.exception("Places search encountered an error")
-            return await self._osm_fallback_or(
-                ToolResult(data={"error": f"Error finding places: {e!s}"}, error=True),
-                hass,
-                tool_input,
+            return ToolResult(
+                data={"error": f"Error finding places: {e!s}"}, error=True
             )

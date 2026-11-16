@@ -1,6 +1,5 @@
 """Tests for the Google Places tool."""
 
-import contextlib
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -32,16 +31,8 @@ def _places_response(places: list | None = None) -> dict:
     return {"places": places or []}
 
 
-def _make_session(
-    responses_by_url: dict[str, dict],
-    get_responses: list[tuple[int, Any]] | None = None,
-) -> AsyncMock:
-    """
-    Build a mock session dispatching POSTs by URL and GETs in order.
-
-    GETs (the OpenStreetMap fallback) consume ``get_responses`` in order,
-    repeating the last one; the default is a single empty 200 response.
-    """
+def _make_session(responses_by_url: dict[str, dict]) -> AsyncMock:
+    """Build a mock session that dispatches POST responses by URL."""
     session = AsyncMock()
 
     def mock_post(url: str, **_kwargs: Any) -> MockContext:
@@ -53,21 +44,6 @@ def _make_session(
         return MockContext(response)
 
     session.post = Mock(side_effect=mock_post)
-
-    get_iter = iter(get_responses or [])
-    last_get: tuple[int, Any] = (200, [])
-
-    def mock_get(_url: str, **_kwargs: Any) -> MockContext:
-        nonlocal last_get
-        with contextlib.suppress(StopIteration):
-            last_get = next(get_iter)
-        status, data = last_get
-        response = AsyncMock()
-        response.status = status
-        response.json = AsyncMock(return_value=data)
-        return MockContext(response)
-
-    session.get = Mock(side_effect=mock_get)
     return session
 
 
@@ -211,14 +187,9 @@ async def test_missing_api_key(
     tool: FindPlacesTool,
     places_hass: HomeAssistant,
 ) -> None:
-    """Missing Google API key surfaces a clear error when the fallback is empty."""
+    """Missing Google API key surfaces a clear error."""
     places_hass.data[DOMAIN]["config"][CONF_PROVIDER_API_KEYS] = {}
-    session = _make_session({})
-    with patch(
-        "custom_components.llm_intents.google_places.async_get_clientsession",
-        return_value=session,
-    ):
-        result = await tool.async_call(places_hass, _tool_input(query="x"), Mock())
+    result = await tool.async_call(places_hass, _tool_input(query="x"), Mock())
     assert isinstance(result, ToolResult)
     assert result.data == {"error": "Google Places API key not configured"}
 
@@ -450,167 +421,3 @@ async def test_cache_stores_result(
     assert call_args[0][1]["textQuery"] == "test"
     stored = call_args[0][2]
     assert stored["results"][0]["name"] == "Found Place"
-
-
-OSM_COSTCO = {
-    "lat": "40.35",
-    "lon": "-76.85",
-    "display_name": "Costco, 5125 Jonestown Road, Harrisburg, PA",
-    "namedetails": {"name": "Costco"},
-    "address": {
-        "house_number": "5125",
-        "road": "Jonestown Road",
-        "city": "Harrisburg",
-        "state": "Pennsylvania",
-        "postcode": "17112",
-    },
-    "extratags": {
-        "phone": "+1-717-555-0100",
-        "opening_hours": "Mo-Fr 10:00-20:30",
-        "website": "https://www.costco.com",
-    },
-}
-
-OSM_COSTCO_RESULT = {
-    "name": "Costco",
-    "address": "5125 Jonestown Road, Harrisburg, Pennsylvania, 17112",
-    "rating": "Not rated",
-    "phone": "+1-717-555-0100",
-    "source": "OpenStreetMap",
-    "opening_hours": "Mo-Fr 10:00-20:30",
-    "website": "https://www.costco.com",
-}
-
-
-async def test_osm_fallback_on_http_error(
-    tool: FindPlacesTool,
-    places_hass: HomeAssistant,
-    cache_miss: Any,
-) -> None:
-    """A Google HTTP error falls back to OpenStreetMap results."""
-    session = _make_session(
-        {PLACES_URL: {"status": 403, "data": {"error": "denied"}}},
-        get_responses=[(200, [OSM_COSTCO])],
-    )
-
-    with patch(
-        "custom_components.llm_intents.google_places.async_get_clientsession",
-        return_value=session,
-    ):
-        result = await tool.async_call(places_hass, _tool_input(query="Costco"), Mock())
-        assert isinstance(result, ToolResult)
-
-    assert result.data == {"results": [OSM_COSTCO_RESULT]}
-    # The first Nominatim lookup is the small bounded box around home
-    # (fixture home: 40.0, -74.0), and a hit there stops the search —
-    # no wider fetch is made.
-    assert session.get.call_count == 1
-    first_get_params = session.get.call_args_list[0].kwargs["params"]
-    assert first_get_params["bounded"] == 1
-    assert first_get_params["limit"] == 50
-    viewbox = [float(part) for part in first_get_params["viewbox"].split(",")]
-    assert viewbox == pytest.approx([-74.1, 40.1, -73.9, 39.9])
-
-
-async def test_osm_fallback_widens_when_small_box_empty(
-    tool: FindPlacesTool,
-    places_hass: HomeAssistant,
-    cache_miss: Any,
-) -> None:
-    """An empty small-box search widens to the larger bounded box."""
-    session = _make_session(
-        {PLACES_URL: {"status": 403, "data": {"error": "denied"}}},
-        get_responses=[(200, []), (200, [OSM_COSTCO])],
-    )
-
-    with patch(
-        "custom_components.llm_intents.google_places.async_get_clientsession",
-        return_value=session,
-    ):
-        result = await tool.async_call(places_hass, _tool_input(query="Costco"), Mock())
-
-    assert result.data == {"results": [OSM_COSTCO_RESULT]}
-    assert session.get.call_count == 2
-    second_get_params = session.get.call_args_list[1].kwargs["params"]
-    assert second_get_params["bounded"] == 1
-    viewbox = [float(part) for part in second_get_params["viewbox"].split(",")]
-    assert viewbox == pytest.approx([-74.5, 40.5, -73.5, 39.5])
-
-
-async def test_osm_fallback_unbounded_when_bounded_empty(
-    tool: FindPlacesTool,
-    places_hass: HomeAssistant,
-    cache_miss: Any,
-) -> None:
-    """When both bounded stages are empty, the search retries unbounded."""
-    session = _make_session(
-        {PLACES_URL: {"status": 403, "data": {"error": "denied"}}},
-        get_responses=[(200, []), (200, []), (200, [OSM_COSTCO])],
-    )
-
-    with patch(
-        "custom_components.llm_intents.google_places.async_get_clientsession",
-        return_value=session,
-    ):
-        result = await tool.async_call(places_hass, _tool_input(query="Costco"), Mock())
-
-    assert result.data == {"results": [OSM_COSTCO_RESULT]}
-    assert session.get.call_count == 3
-    third_get_params = session.get.call_args_list[2].kwargs["params"]
-    assert "bounded" not in third_get_params
-    assert "viewbox" not in third_get_params
-
-
-async def test_osm_fallback_without_api_key(
-    tool: FindPlacesTool,
-    places_hass: HomeAssistant,
-) -> None:
-    """Without a Google API key, OpenStreetMap answers directly."""
-    places_hass.data[DOMAIN]["config"][CONF_PROVIDER_API_KEYS] = {}
-    session = _make_session({}, get_responses=[(200, [OSM_COSTCO])])
-
-    with patch(
-        "custom_components.llm_intents.google_places.async_get_clientsession",
-        return_value=session,
-    ):
-        result = await tool.async_call(places_hass, _tool_input(query="Costco"), Mock())
-
-    assert result.data == {"results": [OSM_COSTCO_RESULT]}
-    assert session.post.call_count == 0
-
-
-async def test_osm_fallback_sorts_by_distance(
-    tool: FindPlacesTool,
-    places_hass: HomeAssistant,
-    cache_miss: Any,
-) -> None:
-    """Fallback results are ordered nearest-first, not by prominence."""
-    far = {
-        "lat": "40.40",
-        "lon": "-74.0",
-        "display_name": "Far Store, Somewhere",
-        "namedetails": {"name": "Far Store"},
-        "address": {},
-        "extratags": {},
-    }
-    near = {
-        "lat": "40.01",
-        "lon": "-74.0",
-        "display_name": "Near Store, Nearby",
-        "namedetails": {"name": "Near Store"},
-        "address": {},
-        "extratags": {},
-    }
-    session = _make_session(
-        {PLACES_URL: {"status": 500, "data": {"error": "boom"}}},
-        get_responses=[(200, [far, near])],
-    )
-
-    with patch(
-        "custom_components.llm_intents.google_places.async_get_clientsession",
-        return_value=session,
-    ):
-        result = await tool.async_call(places_hass, _tool_input(query="store"), Mock())
-
-    names = [place["name"] for place in result.data["results"]]
-    assert names == ["Near Store", "Far Store"]

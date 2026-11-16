@@ -108,7 +108,7 @@ class EntityHistoryTool(BaseTool):
         "For entities with a limited set of distinct states (such as location or presence sensors), the result's stats also include `state_durations`: the total time spent in each state during the search period. Use those totals, rather than estimating from the sampled states, when answering how long a device was in a state or which state it was in for most of a period.\n"
         "For numeric entities, the stats also include `time_weighted_avg`: the average value weighted by how long each value was held. Prefer it over the plain `avg` when answering what the average value was over a period.\n"
         "Questions about a period — an average, a total, how long something lasted, or which state lasted longest — must be answered from this tool's results, never from a current live state.\n"
-        "The entity is resolved flexibly: `name` does not have to be exact, and `domain`/`area` are hints rather than strict filters. If a call fails to resolve the entity, the error result lists the closest candidate entities — retry the call using one candidate's `entity_id` rather than guessing another name. If you already know the entity_id (for example from a previous result), pass `entity_id` directly.\n"
+        "The entity name must be the exact name or alias of an exposed entity, as in Home Assistant itself, and `domain` and `area`, when given, are strict filters: an entity outside the requested area or in another domain will not be returned. If a call fails to resolve the entity, the error result lists the closest candidate entities that match the filters — retry the call using one candidate's `entity_id`, keeping the same `name` and `domain` as the failed call, rather than guessing another name. If you already know the entity_id (for example from a previous result), pass `entity_id` directly.\n"
         "If the user asks how long a numeric value spent above or below a level (for example, how long the temperature was above 25 degrees), pass that level as the `threshold` argument; the result's stats will then include `threshold_duration` with the computed time above and below the threshold. Use those totals rather than estimating from the sampled states.\n"
         "Example queries: `What time did the kitchen reach 25 degrees?` `When was the bedroom light turned off?` `What was the temperature outside at 8am this morning?` `How long was it above 25 degrees today?`"
     )
@@ -116,21 +116,21 @@ class EntityHistoryTool(BaseTool):
 
     parameters = vol.Schema(
         {
-            vol.Optional(
+            vol.Required(
                 "name",
-                description="The name of the entity or device to retrieve the history for. It does not have to be exact — a partial name is resolved against the exposed entities — but an exact name from the device context is preferred. Omit only when passing `entity_id`.",
-            ): str,
-            vol.Optional(
-                "entity_id",
-                description="The exact entity_id of the entity to retrieve history for, as returned in a previous result's candidates. Preferred over `name` when known.",
+                description="The name of the entity or device to retrieve the history for, exactly as it appears in the static device context (case-insensitive).",
             ): str,
             vol.Optional(
                 "area",
-                description="Hint: the area name or alias of the entity (case-insensitive). Used to rank matches, not as a strict filter.",
+                description="Filter entity by area name or alias (case-insensitive).",
+            ): str,
+            vol.Required(
+                "domain",
+                description="Filter entity by the domain (case-insensitive).",
             ): str,
             vol.Optional(
-                "domain",
-                description="Hint: the entity's domain (case-insensitive). Used to rank matches, not as a strict filter.",
+                "entity_id",
+                description="The exact entity_id of the entity to retrieve history for, as returned in a previous result's candidates. Preferred over `name` when known. When retrying with an entity_id from a failed call, also repeat the same `name` and `domain` from that call.",
             ): str,
             vol.Optional(
                 "threshold",
@@ -450,9 +450,11 @@ class EntityHistoryTool(BaseTool):
         Resolve the requested entity to (entity_id, display name).
 
         An explicit entity_id wins and must be exposed. Otherwise the
-        name is resolved by find_entity_by_name (exact, then ranked).
-        With neither, raises EntityNotFoundError carrying the exposed
-        entities matching the area/domain hints as browse candidates.
+        name is resolved by find_entity_by_name (exact match only);
+        a miss raises EntityNotFoundError carrying the closest
+        candidates from the filtered set. With neither, raises
+        EntityNotFoundError carrying the exposed entities matching
+        the area/domain filters as browse candidates.
         """
         entity_id_arg = tool_args.get("entity_id")
         entity_name = tool_args.get("name")
@@ -576,7 +578,8 @@ class EntityHistoryTool(BaseTool):
                     "candidates": err.candidates,
                     "hint": (
                         "Retry the call with one candidate's exact "
-                        "entity_id in the `entity_id` argument."
+                        "entity_id in the `entity_id` argument, keeping "
+                        "the same `name` and `domain` as this call."
                     ),
                 },
                 error=True,
